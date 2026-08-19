@@ -11,6 +11,7 @@ REPO_OWNER="nanashiwang"
 REPO_NAME="CLIProxyAPI"
 INSTALL_DIR="$HOME/cliproxyapi"
 API_URL="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest"
+LATEST_CHECKSUMS_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/latest/download/checksums.txt"
 SCRIPT_NAME="cliproxyapi-installer"
 
 # Colors for output
@@ -391,22 +392,60 @@ check_dependencies() {
     fi
 }
 
-# Fetch latest release info from GitHub API
+# Build minimal release metadata from checksums when the anonymous GitHub API is rate-limited.
+fetch_release_info_from_checksums() {
+    local checksums version filename first=1
+    if command -v curl >/dev/null 2>&1; then
+        checksums=$(curl --connect-timeout 10 --max-time 60 --retry 3 -fsSL "$LATEST_CHECKSUMS_URL") || return 1
+    else
+        checksums=$(wget -qO- "$LATEST_CHECKSUMS_URL") || return 1
+    fi
+
+    version=$(
+        printf '%s\n' "$checksums" |
+            sed -nE 's/^[0-9a-fA-F]{64}[[:space:]]+CLIProxyAPI_(.+)_(darwin|linux|freebsd|windows)_(amd64|aarch64)(_no-plugin)?\.(tar\.gz|zip)$/\1/p' |
+            head -n 1
+    )
+    [[ -n "$version" ]] || return 1
+
+    printf '{"tag_name":"v%s","assets":[' "$version"
+    while read -r _ filename; do
+        [[ -n "${filename:-}" ]] || continue
+        if [[ "$first" -eq 0 ]]; then
+            printf ','
+        fi
+        first=0
+        printf '{"browser_download_url":"https://github.com/%s/%s/releases/download/v%s/%s"}' \
+            "$REPO_OWNER" "$REPO_NAME" "$version" "$filename"
+    done <<< "$checksums"
+    printf ']}\n'
+}
+
+# Fetch latest release info, falling back to the published checksums asset on API 403/rate limits.
 fetch_release_info() {
     log_info "Fetching latest release information..."
-    
-    local release_info
+
+    local release_info=""
     if command -v curl >/dev/null 2>&1; then
-        release_info=$(curl -s "$API_URL")
+        release_info=$(curl --connect-timeout 10 --max-time 60 --retry 3 -fsSL \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'User-Agent: cliproxyapi-installer' \
+            "$API_URL" 2>/dev/null || true)
     else
-        release_info=$(wget -qO- "$API_URL")
+        release_info=$(wget -qO- \
+            --header='Accept: application/vnd.github+json' \
+            --header='User-Agent: cliproxyapi-installer' \
+            "$API_URL" 2>/dev/null || true)
     fi
-    
-    if [[ -z "$release_info" ]]; then
-        log_error "Failed to fetch release information from GitHub API"
-        exit 1
+
+    if [[ "$release_info" != *'"tag_name"'* || "$release_info" != *'"browser_download_url"'* ]]; then
+        log_warning "GitHub API unavailable or rate-limited; using release checksums fallback"
+        release_info=$(fetch_release_info_from_checksums) || {
+            log_error "Failed to fetch release information from GitHub"
+            exit 1
+        }
     fi
-    
+
     echo "$release_info"
 }
 
